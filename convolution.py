@@ -41,29 +41,54 @@ _delta_zero_greek   = re.compile(r"[δ]\s*\(\s*t\s*\)")
 
 def extract_impulses(raw_expr: str):
     """
-    Returns (expr_without_impulses, shifts)
-    where shifts is a list of 'a' for impulses δ(t-a).
-    We interpret delta(t - a) and δ(t - a) as impulses at +a.
-    For delta(t + a) we add an impulse at -a.
+    Returns (expr_without_impulses, impulses)
+    where impulses is a list of (shift, coefficient) tuples for δ(t-shift).
+    
+    Handles:
+    - delta(t - a) or δ(t - a) => impulse at t=+a
+    - delta(t + a) or δ(t + a) => impulse at t=-a  
+    - delta(t) or δ(t) => impulse at t=0
+    - 3*delta(t-2) => impulse with coefficient 3
+    - -delta(t) => impulse with coefficient -1
     """
+    import re
+    
     expr = raw_expr or ""
-    shifts = []
-
-    def _take(m):
-        sign, val = m.group('sign'), float(m.group('val'))
-        # delta(t - a) => shift = +a ; delta(t + a) => shift = -a
-        shifts.append(val if sign == '-' else -val)
-        return "0"
-
-    expr = _delta_signed_ascii.sub(_take, expr)
-    expr = _delta_signed_greek.sub(_take, expr)
-
-    if _delta_zero_ascii.search(expr):
-        expr = _delta_zero_ascii.sub(lambda m: (shifts.append(0.0) or "0"), expr)
-    if _delta_zero_greek.search(expr):
-        expr = _delta_zero_greek.sub(lambda m: (shifts.append(0.0) or "0"), expr)
-
-    return expr, shifts
+    impulses = []  # List of (shift, coefficient) tuples
+    
+    # Pattern to match: [coefficient*]delta(t [+/-] value) or [coefficient*]δ(t [+/-] value)
+    # Captures: optional coefficient, delta/δ, optional sign and value
+    pattern = r'(?P<coef>-?\d*\.?\d*)\s*\*?\s*(?P<delta>delta|δ)\s*\(\s*t\s*(?:(?P<sign>[+-])\s*(?P<val>[0-9.]+))?\s*\)'
+    
+    def replace_impulse(match):
+        coef_str = match.group('coef')
+        sign = match.group('sign')
+        val_str = match.group('val')
+        
+        # Parse coefficient
+        if coef_str == '' or coef_str == '+':
+            coef = 1.0
+        elif coef_str == '-':
+            coef = -1.0
+        else:
+            coef = float(coef_str)
+        
+        # Parse shift
+        if val_str is None:
+            # delta(t) or δ(t)
+            shift = 0.0
+        else:
+            val = float(val_str)
+            # delta(t - a) => shift = +a
+            # delta(t + a) => shift = -a
+            shift = val if sign == '-' else -val
+        
+        impulses.append((shift, coef))
+        return "0"  # Replace impulse with 0 in expression
+    
+    expr = re.sub(pattern, replace_impulse, expr)
+    
+    return expr, impulses
 
 def evaluate_expr(expr: str, t: np.ndarray) -> np.ndarray:
     """Safely evaluate an expression of t into a 1D array matching t.shape."""
@@ -88,23 +113,43 @@ def evaluate_expr(expr: str, t: np.ndarray) -> np.ndarray:
 def add_impulse_contributions_fullgrid(y_full, t_full,
                                        t_xpad, x_pad,
                                        t_hpad, h_pad,
-                                       x_impulses, h_impulses):
+                                       x_impulses, h_impulses,
+                                       dt):
     """
-    Add the contributions due to impulses using the correct time bases.
-
-    If x includes δ(t - a): y(t) += h(t - a).
-    If h includes δ(t - a): y(t) += x(t - a).
-
-    All of this is performed on the FULL convolution grid (y_full, t_full).
+    Add the contributions due to impulses with coefficients.
+    
+    If x includes c1*δ(t - a): y(t) += c1*h(t - a).
+    If h includes c2*δ(t - b): y(t) += c2*x(t - b).
+    If both have impulses: δ(t-a) * δ(t-b) = δ(t - (a+b))
+    
+    x_impulses and h_impulses are lists of (shift, coefficient) tuples.
     """
+    # Impulse-to-impulse convolution: δ(t-a) * δ(t-b) = δ(t-(a+b))
+    if x_impulses and h_impulses:
+        for x_shift, x_coef in x_impulses:
+            for h_shift, h_coef in h_impulses:
+                # Resulting impulse at (x_shift + h_shift) with amplitude (x_coef * h_coef)
+                total_shift = x_shift + h_shift
+                total_coef = x_coef * h_coef
+                # Add impulse spike at the appropriate location
+                idx = np.argmin(np.abs(t_full - total_shift))
+                if 0 <= idx < len(y_full):
+                    y_full[idx] += total_coef / dt
+    
+    # Impulse in x convolves with continuous h
     if x_impulses:
-        for a in x_impulses:
-            # Add h(t - a) sampled on t_full
-            y_full += np.interp(t_full - a, t_hpad, h_pad, left=0.0, right=0.0)
+        for shift, coef in x_impulses:
+            # Add coef * h(t - shift) sampled on t_full
+            h_shifted = np.interp(t_full - shift, t_hpad, h_pad, left=0.0, right=0.0)
+            y_full += coef * h_shifted
+            
+    # Impulse in h convolves with continuous x
     if h_impulses:
-        for a in h_impulses:
-            # Add x(t - a) sampled on t_full
-            y_full += np.interp(t_full - a, t_xpad, x_pad, left=0.0, right=0.0)
+        for shift, coef in h_impulses:
+            # Add coef * x(t - shift) sampled on t_full
+            x_shifted = np.interp(t_full - shift, t_xpad, x_pad, left=0.0, right=0.0)
+            y_full += coef * x_shifted
+    
     return y_full
 
 # ==============================
@@ -170,7 +215,7 @@ if mode == "Continuous":
 
             # Full convolution time base
             # start time = start_x + start_h
-            t_full_start = t_xpad[0] + t_hpad[0]
+            t_full_start = t_x0 + t_h0
             t_full = t_full_start + np.arange(y_full.size) * dt
 
             # Add impulse contributions on the full grid
@@ -178,7 +223,8 @@ if mode == "Continuous":
                 y_full, t_full,
                 t_xpad, x_pad,
                 t_hpad, h_pad,
-                x_impulses, h_impulses
+                x_impulses, h_impulses,
+                dt
             )
 
             # Resample back to original t for plotting
@@ -219,8 +265,8 @@ if mode == "Continuous":
             ax[0].plot(t, x, linewidth=3, label="x(t) (no impulses)")
             if x_impulses:
                 x_spike = np.zeros_like(t)
-                for a_shift in x_impulses:
-                    x_spike += impulse_on_grid(t, a_shift, dt)
+                for shift, coef in x_impulses:
+                    x_spike += coef * impulse_on_grid(t, shift, dt)
                 ax[0].plot(t, x_spike, alpha=0.6, label="impulses in x")
             ax[0].set_title("x(t)", color="white", fontsize=14)
             ax[0].legend(fontsize=12, framealpha=0.12, facecolor="black")
@@ -229,8 +275,8 @@ if mode == "Continuous":
             ax[1].plot(t, h, linewidth=3, label="h(t) (no impulses)")
             if h_impulses:
                 h_spike = np.zeros_like(t)
-                for a_shift in h_impulses:
-                    h_spike += impulse_on_grid(t, a_shift, dt)
+                for shift, coef in h_impulses:
+                    h_spike += coef * impulse_on_grid(t, shift, dt)
                 ax[1].plot(t, h_spike, alpha=0.6, label="impulses in h")
             ax[1].set_title("h(t)", color="white", fontsize=14)
             ax[1].legend(fontsize=12, framealpha=0.12, facecolor="black")
@@ -265,7 +311,7 @@ elif mode == "Discrete":
     x = (n >= 0).astype(int)
     h = (n == 0).astype(int) + (n == 1).astype(int)
     y = np.convolve(x, h, mode="full")
-    n_out = np.arange(len(y)) + n[0] + n[0]
+    n_out = np.arange(len(y)) + 2*n[0]
 
     fig, ax = plt.subplots(3, 1, figsize=(10, 9), sharex=False)
     fig.patch.set_alpha(0)
